@@ -40,7 +40,7 @@ class DeepLCFeatureGenerator(FeatureGeneratorBase):
         *args,
         lower_score_is_better: bool = False,
         calibration_set_size: Union[int, float, None] = None,
-        processes: int = 1,
+        processes: int = 16,
         **kwargs,
     ) -> None:
         """
@@ -95,6 +95,12 @@ class DeepLCFeatureGenerator(FeatureGeneratorBase):
         if "path_model" in self.deeplc_kwargs:
             self.user_model = self.deeplc_kwargs.pop("path_model")
             logging.debug(f"Using user-provided DeepLC model {self.user_model}.")
+            self.deeplc_predictor = self.DeepLC(
+                n_jobs=self.processes,
+                verbose=self._verbose,
+                path_model=self.user_model,
+                **self.deeplc_kwargs,
+            )
         else:
             self.user_model = None
 
@@ -109,7 +115,7 @@ class DeepLCFeatureGenerator(FeatureGeneratorBase):
             "rt_diff_best",
         ]
 
-    def retrain_deeplc(self, psm_list: PSMList) -> None:
+    def retrain_deeplc(self, psm_list: PSMList, save_model_folder="") -> None:
         logger.info("Transfer learning of DeepLC model")
 
         # Get easy-access nested version of PSMList
@@ -146,7 +152,7 @@ class DeepLCFeatureGenerator(FeatureGeneratorBase):
                         path_model=self.selected_model or self.user_model,
                         **self.deeplc_kwargs,
                     )
-                    self.deeplc_predictor.calibrate_preds(psm_list_calibration)
+                    self.deeplc_predictor.calibrate_preds(psm_list_calibration, location_retraining_models=save_model_folder)
                     # Still calibrate for each run, but do not try out all model options.
                     # Just use model that was selected based on first run
                     if not self.selected_model:
@@ -192,6 +198,7 @@ class DeepLCFeatureGenerator(FeatureGeneratorBase):
                     # Make new PSM list for this run (chain PSMs per spectrum to flat list)
                     psm_list_run = PSMList(psm_list=list(chain.from_iterable(psms.values())))
 
+                    # Calibrate set to false as the model used is already calibrated.
                     predictions = np.array(self.deeplc_predictor.make_preds(psm_list_run))
                     observations = psm_list_run["retention_time"]
                     rt_diffs_run = np.abs(predictions - observations)

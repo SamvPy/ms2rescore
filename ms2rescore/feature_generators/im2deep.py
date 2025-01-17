@@ -57,6 +57,7 @@ class IM2DeepFeatureGenerator(FeatureGeneratorBase):
             k: v for k, v in self.im2deep_kwargs.items() if k in getfullargspec(predict_ccs).args
         }
         self.im2deep_kwargs["n_jobs"] = processes
+        self.cal_psm_df = None
 
     @property
     def feature_names(self) -> List[str]:
@@ -69,8 +70,14 @@ class IM2DeepFeatureGenerator(FeatureGeneratorBase):
         ]
 
     def add_features(self, psm_list: PSMList) -> None:
-        """Add IM2Deep-derived features to PSMs"""
+        """
+        Add IM2Deep-derived features to PSMs
+        """
         logger.info("Adding IM2Deep-derived features to PSMs")
+
+        # Should perform calibration before
+        if self.cal_psm_df is None:
+            raise Exception("Create a calibration dataframe for IM2Deep first by calling make_calibration_df!")
 
         # Get easy-access nested version of PSMlist
         psm_dict = psm_list.get_psm_dict()
@@ -78,10 +85,16 @@ class IM2DeepFeatureGenerator(FeatureGeneratorBase):
         # Run IM2Deep for each spectrum file
         current_run = 1
         total_runs = sum(len(runs) for runs in psm_dict.values())
+        
+        # Too harsh?
+        if total_runs > 1:
+            raise Exception(
+                "IM2Deep expects psms in psm-list originate from a single run. Split the psm_list!"
+            )
 
         for runs in psm_dict.values():
             # Reset IM2Deep predictor for each collection of runs
-            for run, psms in runs.items():
+            for run, psms in runs.items():                
                 logger.info(
                     f"Running IM2Deep for PSMs from run ({current_run}/{total_runs}): `{run}`..."
                 )
@@ -108,13 +121,10 @@ class IM2DeepFeatureGenerator(FeatureGeneratorBase):
                         psm_list_run_df["charge"],
                     )
 
-                    # Create dataframe with high confidence hits for calibration
-                    cal_psm_df = self.make_calibration_df(psm_list_run_df)
-
                     # Make predictions with IM2Deep
                     logger.debug("Predicting CCS values...")
                     predictions = predict_ccs(
-                        psm_list_run, cal_psm_df, write_output=False, **self.im2deep_kwargs
+                        psm_list_run, self.cal_psm_df, write_output=False, **self.im2deep_kwargs
                     )
 
                     # Add features to PSMs
@@ -133,11 +143,15 @@ class IM2DeepFeatureGenerator(FeatureGeneratorBase):
                                 * 100,
                             }
                         )
-
                 current_run += 1
 
-    @staticmethod
-    def make_calibration_df(psm_list_df: pd.DataFrame, threshold: float = 0.25) -> pd.DataFrame:
+
+    def make_calibration_df(
+        self, 
+        psm_list: PSMList = None,
+        threshold: float = 0.25
+
+    ) -> pd.DataFrame:
         """
         Make dataframe for calibration of IM2Deep predictions.
 
@@ -147,7 +161,7 @@ class IM2DeepFeatureGenerator(FeatureGeneratorBase):
             DataFrame with PSMs.
         threshold
             Percentage of highest scoring identified target PSMs to use for calibration,
-            default 0.95.
+            default 0.25.
 
         Returns
         -------
@@ -155,15 +169,43 @@ class IM2DeepFeatureGenerator(FeatureGeneratorBase):
             DataFrame with high confidence hits for calibration.
 
         """
-        identified_psms = psm_list_df[
-            (psm_list_df["qvalue"] < 0.01)
-            & (~psm_list_df["is_decoy"])
-            & (psm_list_df["charge"] < 5)  # predictions do not go higher for IM2Deep
-        ]
-        calibration_psms = identified_psms[
-            identified_psms["qvalue"] < identified_psms["qvalue"].quantile(1 - threshold)
-        ]
-        logger.debug(
-            f"Number of high confidence hits for calculating shift: {len(calibration_psms)}"
-        )
-        return calibration_psms
+        # Get easy-access nested version of PSMlist
+        psm_dict = psm_list.get_psm_dict()
+
+        for runs in psm_dict.values():
+            # Reset IM2Deep predictor for each collection of runs
+            for run, psms in runs.items():                
+
+                # Disable wild logging to stdout by TensorFlow, unless in debug mode
+                with (
+                    contextlib.redirect_stdout(open(os.devnull, "w", encoding="utf-8"))
+                    if not self._verbose
+                    else contextlib.nullcontext()
+                ):
+                    # Make new PSM list for this run (chain PSMs per spectrum to flat list)
+                    psm_list_run = PSMList(psm_list=list(chain.from_iterable(psms.values())))
+
+                    logger.debug("Calibrating IM2Deep...")
+
+                    # Convert ion mobility to CCS and calibrate CCS values
+                    psm_list_run_df = psm_list_run.to_dataframe()
+                    psm_list_run_df["charge"] = [
+                        pep.precursor_charge for pep in psm_list_run_df["peptidoform"]
+                    ]
+                    psm_list_run_df["ccs_observed"] = im2ccs(
+                        psm_list_run_df["ion_mobility"],
+                        psm_list_run_df["precursor_mz"],
+                        psm_list_run_df["charge"],
+                    )
+                    identified_psms = psm_list_run_df[
+                        (psm_list_run_df["qvalue"] < 0.01)
+                        & (~psm_list_run_df["is_decoy"])
+                        & (psm_list_run_df["charge"] < 5)  # predictions do not go higher for IM2Deep
+                    ]
+                    calibration_psms = identified_psms[
+                        identified_psms["qvalue"] < identified_psms["qvalue"].quantile(1 - threshold)
+                    ]
+                    logger.debug(
+                        f"Number of high confidence hits for calculating shift: {len(calibration_psms)}"
+                    )
+                    return calibration_psms
